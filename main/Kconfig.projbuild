@@ -1,0 +1,56 @@
+menu "Clock Configuration"
+
+config WIFI_SSID
+    string "WiFi SSID"
+    default "myssid"
+    help
+        SSID (network name) to connect to.
+
+config WIFI_PASSWORD
+    string "WiFi Password"
+    default "mypassword"
+    help
+        WiFi password (WPA or WPA2).
+
+config DISPLAY_TIMEOUT
+    int "Display Timeout"
+    default 5000
+    help
+        Timeout for LED display to return to time display.
+
+config BUTTON_PIN
+    int "Button Pin"
+    default 13
+    help
+        GPIO pin number connected to button.
+        
+config TEMP_SENSOR_PIN
+    int "Temp Sensor Pin"
+    default 14
+    help
+        GPIO pin number connected to temperature sensor.
+
+config BUTTON_DEBOUNCE_INTERVAL
+    int "Button Debounce Interval (ms)"
+    default 150
+    help
+        Button debounce interval in milliseconds. Prevents double registration.
+
+config NTP_SERVER
+    string "NTP Server"
+    default "0.europe.pool.ntp.org"
+    help
+        Network Time Protocol (NTP) server for time synchronization.
+
+config NTP_REFRESH_SEC
+    int "NTP Refresh Time (s)"
+    default 43200
+    help
+        Network Time Protocol (NTP) time between refresh in seconds.
+
+config TIME_ZONE
+    string "Time Zone"
+    default "CET-1CEST,M3.5.0/2,M10.5.0/3"
+    help
+        Local Time Zone
+endmenu
