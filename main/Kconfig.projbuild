@@ -53,4 +53,29 @@ config TIME_ZONE
     default "CET-1CEST,M3.5.0/2,M10.5.0/3"
     help
         Local Time Zone
+      
+config PIN_NUM_MISO
+    int "SPI MISO Pin"
+    default 25
+    help
+        MISO pin number for the LED display.
+
+config PIN_NUM_MOSI
+    int "SPI MOSI Pin"
+    default 23
+    help
+        MOSI pin number for the LED display.
+
+config PIN_NUM_CLK
+    int "SPI CLK Pin"
+    default 19
+    help
+        CLK pin number for the LED display.
+        
+config PIN_NUM_CS
+    int "SPI CS Pin"
+    default 22
+    help
+        CS pin number for the LED display.
+
 endmenu

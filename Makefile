@@ -3,7 +3,8 @@
 # project subdirectory.
 #
 
-PROJECT_NAME := app-template
+PROJECT_NAME := smart-clock
 
 include $(IDF_PATH)/make/project.mk
 
+CPPFLAGS += -DARCH_ESP32

@@ -8,7 +8,7 @@ This is part of a school assignment for embedded systems.
 
 ## Installation
 
-Clone the repository, run make menuconfig and make flash monitor
+Make sure you have the esp-idf environment set up. Clone the repository, run make menuconfig and make flash monitor
 
 ## License
 
