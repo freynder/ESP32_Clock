@@ -55,6 +55,8 @@
 #include "ds18b20.h"
 #include "MD_MAX72xx.h"
 
+#include "mqtt.h"
+
 // Number of chained LED matrix panels
 #define MAX_DEVICES 4
 // OpenWeatherMap info
@@ -81,7 +83,7 @@ typedef struct {
 } display_data_t;
 
 typedef struct {
-  const char* queueName;
+  const char* topic;
   float data;
 } mqtt_data_t;
 
@@ -90,11 +92,15 @@ static EventGroupHandle_t wifi_event_group;
 static SemaphoreHandle_t xSemaphore = NULL;
 QueueHandle_t xDisplayQueue;
 QueueHandle_t xMQTTQueue;
+boolean mqttReady = false;
 
 /* The event group allows multiple bits for each event,
  but we only care about one event - are we connected
  to the AP with an IP? */
 const static int CONNECTED_BIT = BIT0;
+
+mqtt_settings mq_settings;
+mqtt_client *mq_client;
 
 /**
  * Initialization routines for LED display. Initializes the SPI bus and attaches
@@ -534,18 +540,34 @@ void displayTask(void *pvParameters) {
   }
 }
 
+/**
+ * RTOS task to manage MQTT communications
+ *
+ * @param pvParameters RTOS parameter, not used
+ */
 void mqttTask(void *pvParameters) {
   // Prepare vars
   mqtt_data_t xReceiveStructure;
   BaseType_t xStatus;
   TickType_t xTicksToWait = pdMS_TO_TICKS(500); // Wait for max 500ms on each iteration
+  char buffer[16];
+  uint32_t length;
 
   // task loop
   while (1) {
+    // Check if MQTT is reay
+    if(!mqttReady) {
+      ESP_LOGD(TAG, "MQTT connection not ready, waiting 500ms");
+      vTaskDelay(pdMS_TO_TICKS(500));
+      continue; // Try again
+    }
     // Wait for queue event
     xStatus = xQueueReceive(xMQTTQueue, &xReceiveStructure, xTicksToWait);
     if (xStatus == pdPASS) {
-      ESP_LOGD(TAG, "MQTT queue received data: queue: %s", xReceiveStructure.queueName);
+      ESP_LOGD(TAG, "MQTT queue received data: topic: %s , value: %.1f", xReceiveStructure.topic,
+          xReceiveStructure.data);
+      length = snprintf(buffer, 16, "%.1f", xReceiveStructure.data);
+      mqtt_publish(mq_client, xReceiveStructure.topic, buffer, length, 0, 0);
     }
   }
 }
@@ -641,12 +663,15 @@ static esp_err_t wifi_event_handler(void *ctx, system_event_t *event) {
     break;
   case SYSTEM_EVENT_STA_GOT_IP:
     xEventGroupSetBits(wifi_event_group, CONNECTED_BIT);
+    mqtt_start(&mq_settings);
+    mqttReady = true;
     break;
   case SYSTEM_EVENT_STA_DISCONNECTED:
     xEventGroupClearBits(wifi_event_group, CONNECTED_BIT);
     /* This is a workaround as ESP32 WiFi libs don't currently
      auto-reassociate. */
-    // TODO: check if still necessary
+    mqttReady = false;
+    mqtt_stop();
     esp_wifi_connect();
     break;
   default:
@@ -655,51 +680,93 @@ static esp_err_t wifi_event_handler(void *ctx, system_event_t *event) {
   return ESP_OK;
 }
 
+void connected_cb(void *self, void *params) {
+  mq_client = (mqtt_client *) self;
+}
+
+void disconnected_cb(void *self, void *params) {
+
+}
+void reconnect_cb(void *self, void *params) {
+
+}
+void subscribe_cb(void *self, void *params) {
+  ESP_LOGD(TAG, "Subscribe OK");
+}
+
+void publish_cb(void *self, void *params) {
+  ESP_LOGD(TAG, "Publish OK");
+}
+void data_cb(void *self, void *params) {
+
+}
+
+static void mqttInit(void) {
+  strcpy(mq_settings.host, CONFIG_MQTT_HOST);
+  mq_settings.port = 1883;
+  strcpy(mq_settings.client_id, "mqtt_client_id");
+  strcpy(mq_settings.username, "user");
+  strcpy(mq_settings.password, "pass");
+  mq_settings.clean_session = 0;
+  mq_settings.keepalive = 120;
+  strcpy(mq_settings.lwt_topic, "/lwt");
+  strcpy(mq_settings.lwt_msg, "offline");
+  mq_settings.lwt_qos = 0;
+  mq_settings.lwt_retain = 0;
+  mq_settings.connected_cb = (mqtt_event_callback) connected_cb;
+  mq_settings.disconnected_cb = (mqtt_event_callback) disconnected_cb;
+  mq_settings.reconnect_cb = (mqtt_event_callback) reconnect_cb;
+  mq_settings.subscribe_cb = (mqtt_event_callback) subscribe_cb;
+  mq_settings.publish_cb = (mqtt_event_callback) publish_cb;
+  mq_settings.data_cb = (mqtt_event_callback) data_cb;
+}
+
 /**
  * Initialize WiFi connection
  */
 static void wifiInit(void) {
-  tcpip_adapter_init();
-  wifi_event_group = xEventGroupCreate();
-  ESP_ERROR_CHECK(esp_event_loop_init(wifi_event_handler, NULL));
-  wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT()
-  ;
-  ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-  ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
-  wifi_config_t wifi_config;
-  wifi_ap_config_t wifi_ap_config;
-  wifi_ap_config.ssid_len = 0;
-  wifi_ap_config.channel = 0;
-  wifi_ap_config.authmode = WIFI_AUTH_MAX;
-  wifi_ap_config.ssid_hidden = 0;
-  wifi_ap_config.max_connection = 4;
-  wifi_ap_config.beacon_interval = 100;
-  strcpy(reinterpret_cast<char*>(wifi_ap_config.ssid), CONFIG_WIFI_SSID);
-  strcpy(reinterpret_cast<char*>(wifi_ap_config.password), CONFIG_WIFI_PASSWORD);
-  wifi_config.ap = wifi_ap_config;
-  ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-  ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-  ESP_ERROR_CHECK(esp_wifi_start());
+tcpip_adapter_init();
+wifi_event_group = xEventGroupCreate();
+ESP_ERROR_CHECK(esp_event_loop_init(wifi_event_handler, NULL));
+wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT()
+;
+ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+wifi_config_t wifi_config;
+wifi_ap_config_t wifi_ap_config;
+wifi_ap_config.ssid_len = 0;
+wifi_ap_config.channel = 0;
+wifi_ap_config.authmode = WIFI_AUTH_MAX;
+wifi_ap_config.ssid_hidden = 0;
+wifi_ap_config.max_connection = 4;
+wifi_ap_config.beacon_interval = 100;
+strcpy(reinterpret_cast<char*>(wifi_ap_config.ssid), CONFIG_WIFI_SSID);
+strcpy(reinterpret_cast<char*>(wifi_ap_config.password), CONFIG_WIFI_PASSWORD);
+wifi_config.ap = wifi_ap_config;
+ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+ESP_ERROR_CHECK(esp_wifi_start());
 }
 
 /**
  * Main routine: perform initialization and create RTOS tasks
  */
 extern "C" void app_main() {
-  spi_device_handle_t spi;
-  ESP_ERROR_CHECK(nvs_flash_init());
+spi_device_handle_t spi;
+ESP_ERROR_CHECK(nvs_flash_init());
 
 // Prepare RTOS queue
-  xDisplayQueue = xQueueCreate(16, sizeof(display_data_t));
-  xMQTTQueue = xQueueCreate(16, sizeof(mqtt_data_t));
+xDisplayQueue = xQueueCreate(16, sizeof(display_data_t));
+xMQTTQueue = xQueueCreate(16, sizeof(mqtt_data_t));
 
-  spi = displayInit();
-  xTaskCreate(&displayTask, "displayTask", 4096, spi, 5, NULL);
-  xTaskCreate(&timeTask, "timeTask", 2048, NULL, 5, NULL);
-  xTaskCreate(&buttonTask, "buttonTask", 2048, NULL, 5, NULL);
-  xTaskCreate(&insideTemperatureTask, "insideTemperatureTask", 2048, NULL, 4, NULL);
-  wifiInit();
-  xTaskCreate(&ntpTask, "ntpTask", 2048, NULL, 3, NULL);
-  xTaskCreate(&outsideTemperatureTask, "outsideTemperatureTask", 4096, NULL, 4, NULL);
-  xTaskCreate(&mqttTask, "mqttTask", 2048, NULL, 2, NULL);
+spi = displayInit();
+xTaskCreate(&displayTask, "displayTask", 4096, spi, 5, NULL);
+xTaskCreate(&timeTask, "timeTask", 2048, NULL, 5, NULL);
+xTaskCreate(&buttonTask, "buttonTask", 2048, NULL, 5, NULL);
+xTaskCreate(&insideTemperatureTask, "insideTemperatureTask", 2048, NULL, 4, NULL);
+mqttInit();
+wifiInit();
+xTaskCreate(&ntpTask, "ntpTask", 2048, NULL, 3, NULL);
+xTaskCreate(&outsideTemperatureTask, "outsideTemperatureTask", 4096, NULL, 4, NULL);
+xTaskCreate(&mqttTask, "mqttTask", 4096, NULL, 2, NULL);
 }

@@ -90,4 +90,10 @@ config OWM_APP_ID
   help
     OpenWeatherMap App ID
 
+config MQTT_HOST
+  string "MQTT Host"
+  default "192.168.1.128"
+  help
+    MQTT Host
+
 endmenu
