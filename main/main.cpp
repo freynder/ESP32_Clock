@@ -72,7 +72,7 @@ void insideTemperatureTask(void *pvParameters) {
 
   while (1) {
     printf("Temperature: %0.1f\n", DS_get_temp());
-    vTaskDelay(5000 / portTICK_PERIOD_MS);
+    vTaskDelay(pdMS_TO_TICKS(5000));
   }
 }
 
@@ -148,7 +148,7 @@ void displayTime(bool forceUpdate) {
   // Toggle colon between hours and minutes once every second
   currentTicks = xTaskGetTickCount();
   bool colonToggled = false;
-  if (lastColonToggle == 0 || currentTicks - lastColonToggle >= (1000 / portTICK_PERIOD_MS)) {
+  if (lastColonToggle == 0 || currentTicks - lastColonToggle >= pdMS_TO_TICKS(1000)) {
     lastColonToggle = currentTicks;
     displayColonChar = !displayColonChar;
     colonToggled = true;
@@ -360,8 +360,7 @@ void buttonTask(void *pvParameters) {
       currentButtonPressTick = xTaskGetTickCount();
       // Only process once per debounce interval
       // TODO: optimize debouncing
-      if (currentButtonPressTick - lastButtonPressTick >
-      CONFIG_BUTTON_DEBOUNCE_INTERVAL / portTICK_PERIOD_MS) {
+      if (currentButtonPressTick - lastButtonPressTick > pdMS_TO_TICKS(CONFIG_BUTTON_DEBOUNCE_INTERVAL)) {
         ESP_LOGD(TAG, "Button pressed!");
       }
       lastButtonPressTick = currentButtonPressTick;
@@ -384,7 +383,7 @@ void ntpTask(void *pvParameters) {
   sntp_setservername(0, servername);
   sntp_init();
   while (1) {
-    vTaskDelay(CONFIG_NTP_REFRESH_SEC * 1000 / portTICK_PERIOD_MS);
+    vTaskDelay(pdMS_TO_TICKS(CONFIG_NTP_REFRESH_SEC * 1000));
     ESP_LOGI(TAG, "Refreshing SNTP");
     ESP_LOGI(TAG, "SNTP: Waiting for network");
     xEventGroupWaitBits(wifi_event_group, CONNECTED_BIT,
