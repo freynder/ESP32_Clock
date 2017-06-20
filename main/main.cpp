@@ -142,10 +142,13 @@ spi_device_handle_t displayInit() {
 }
 
 /**
+ * Construct string to display time
  *
- * Update LED display with current information
- *
- * @param forceUpdate force the display to update itself.
+ * @param displayColonChar show colon character between hour and minute or not
+ * @param hour hour to display
+ * @param minutes minutes to display
+ * @param target where to store the resulting string
+ * @param maxLength maximum length supported by target
  */
 void constructTimeString(bool displayColonChar, uint32_t hour, uint32_t minutes, char *target,
     uint32_t maxLength) {
@@ -156,14 +159,25 @@ void constructTimeString(bool displayColonChar, uint32_t hour, uint32_t minutes,
       minutes);
 }
 
+/**
+ * Construct string to display temperature
+ *
+ * @param temp temperature to display
+ * @param target where to store the resulting string
+ * @param maxLength maximum length supported by target
+ */
 void constructTempString(float temp, char *target, uint32_t maxLength) {
   snprintf(target, maxLength, "%.1f%cC", temp, 248);
 }
 
-void displayOutsideTemp() {
-  // TODO
-}
-
+/**
+ * Helper function to transform text to matrix and display it
+ *
+ * @param mx MD_MAX72XX instance
+ * @param modStart start of chained matrix devices
+ * @param modEnd end of chained matrix devices
+ * @param pMsg text to display
+ */
 // Text parameters
 #define CHAR_SPACING  1 // pixels between characters
 void printText(MD_MAX72XX *mx, uint8_t modStart, uint8_t modEnd, char *pMsg)
