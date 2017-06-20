@@ -53,30 +53,30 @@
 // For logging
 static const char *TAG = "clock";
 
-typedef enum {
+typedef enum display_state_t {
   TIME, INSIDE_TEMP, OUTSIDE_TEMP
-} display_state_t;
+};
 
-typedef enum {
-  UPDATE_COLON, UPDATE_TIME, CHANGE_STATE
-} display_command_t;
+typedef enum display_command_t {
+  UPDATE_TIME_CMD, BLINK_CMD, BUTTON_PRESS_CMD, INSIDE_TEMP_CMD, OUTSIDE_TEMP_CMD
+};
 
-typedef struct {
+typedef struct display_data_t {
   display_command_t command;
-  void* data;
-} display_data_t;
+  uint32_t intData1;
+  uint32_t intData2;
+  float floatData1;
+};
 
 // RTOS Event Handles
 static EventGroupHandle_t wifi_event_group;
 static SemaphoreHandle_t xSemaphore = NULL;
 QueueHandle_t xDisplayQueue;
 
-
 /* The event group allows multiple bits for each event,
  but we only care about one event - are we connected
  to the AP with an IP? */
 const static int CONNECTED_BIT = BIT0;
-
 
 /**
  * Initialization routines for LED display. Initializes the SPI bus and attaches
@@ -129,21 +129,17 @@ spi_device_handle_t displayInit() {
  *
  * @param forceUpdate force the display to update itself.
  */
-void constructTimeString(bool displayColonChar, char *target, uint32_t maxLength) {
-  static time_t now;
-  static struct tm timeinfo;
+void constructTimeString(bool displayColonChar, uint32_t hour, uint32_t minutes, char *target,
+    uint32_t maxLength) {
   static char timeFormatWithoutColon[] = "%02d %02d";
   static char timeFormatWithColon[] = "%02d:%02d";
-
   // Construct current time string
-  time(&now);
-  localtime_r(&now, &timeinfo);
-  snprintf(target, maxLength, displayColonChar ? timeFormatWithColon : timeFormatWithoutColon,
-      timeinfo.tm_hour, timeinfo.tm_min);
+  snprintf(target, maxLength, displayColonChar ? timeFormatWithColon : timeFormatWithoutColon, hour,
+      minutes);
 }
 
-void displayTemp() {
-  // TODO
+void constructTempString(float temp, char *target, uint32_t maxLength) {
+  snprintf(target, maxLength, "%.1f%cC", temp, 248);
 }
 
 void displayOutsideTemp() {
@@ -220,9 +216,55 @@ void insideTemperatureTask(void *pvParameters) {
   DS_init(CONFIG_TEMP_SENSOR_PIN);
 
   while (1) {
+    float temp = DS_get_temp();
     printf("Temperature: %0.1f\n", DS_get_temp());
-    vTaskDelay(pdMS_TO_TICKS(5000));
+    display_data_t data = { INSIDE_TEMP_CMD, NULL, NULL, temp };
+    xQueueSendToBack(xDisplayQueue, &data, 0); // Send without blocking
+    vTaskDelay(pdMS_TO_TICKS(1000));
   }
+}
+
+/**
+ * RTOS task to manage time changes
+ *
+ * @param pvParameters RTOS parameter, not used
+ */
+void timeTask(void *pvParameters) {
+  static time_t now;
+  static struct tm timeinfo;
+  static uint32_t previousHour = 0;
+  static uint32_t previousMinute = 0;
+  static bool first = true;
+
+  // Initialize timezone
+  setenv("TZ", CONFIG_TIME_ZONE, 1);
+  tzset();
+
+  while (1) {
+    // Check every half second for time changes
+    // Construct current time string
+    time(&now);
+    localtime_r(&now, &timeinfo);
+    if (first || previousHour != timeinfo.tm_hour || previousMinute != timeinfo.tm_min) {
+      first = false;
+      previousHour = timeinfo.tm_hour;
+      previousMinute = timeinfo.tm_min;
+      // Notify display
+      display_data_t data = { UPDATE_TIME_CMD, previousHour, previousMinute, NULL };
+      xQueueSendToBack(xDisplayQueue, &data, 0); // Send without blocking
+    }
+    vTaskDelay(pdMS_TO_TICKS(500)); // Wait 500ms
+  }
+}
+
+/**
+ * RTOS Software Timer Callback function for time colon blink
+ *
+ * @param xTimer
+ */
+void blinkTimerCallback(TimerHandle_t xTimer) {
+  display_data_t data = { BLINK_CMD, NULL, NULL, NULL };
+  xQueueSendToBack(xDisplayQueue, &data, 0); // Send without blocking
 }
 
 /**
@@ -232,6 +274,8 @@ void insideTemperatureTask(void *pvParameters) {
  */
 void displayTask(void *pvParameters) {
   ESP_LOGD(TAG, "Starting displayTask");
+  TimerHandle_t blinkTimer;
+  TimerHandle_t displayTimoutTimer;
 
   // Prepare variables
   BaseType_t xStatus;
@@ -240,6 +284,15 @@ void displayTask(void *pvParameters) {
   TickType_t xTicksToWait = pdMS_TO_TICKS(500); // Wait for max 500ms on each iteration
   spi_device_handle_t spi = (spi_device_handle_t) pvParameters;
   char msg[16]; // buffer to hold message to display
+  static uint32_t currentHour = 0;
+  static uint32_t currentMinute = 0;
+  float currentInsideTemp = 0.;
+  float currentOutsideTemp = 0.;
+  boolean blinkToggle = true;
+
+  // Init blink timer
+  blinkTimer = xTimerCreate("blinkTimer", pdMS_TO_TICKS(1000), pdTRUE, 0, blinkTimerCallback);
+  xTimerStart(blinkTimer, 0);
 
   // Initialize led hardware
   ESP_LOGD(TAG, "Initializing MD_MAX72XX");
@@ -248,21 +301,65 @@ void displayTask(void *pvParameters) {
   mx.control(MD_MAX72XX::INTENSITY, 0);
   ESP_LOGD(TAG, "MD_MAX72XX Initialized");
 
-  // Test print
-  char hallo[] = "Elsie";
-  ESP_LOGD(TAG, "TEST print time start");
-  constructTimeString(true, msg, 16);
-  ESP_LOGD(TAG, "Printing %s", msg);
-  printText(&mx, 0, MAX_DEVICES - 1, hallo);
-  ESP_LOGD(TAG, "TEST print time completed");
-
   // task loop
   while (1) {
     // Wait for queue event
-    xStatus = xQueueReceive(xDisplayQueue, &xReceiveStructure, xTicksToWait );
-    if(xStatus == pdPASS) {
+    xStatus = xQueueReceive(xDisplayQueue, &xReceiveStructure, xTicksToWait);
+    if (xStatus == pdPASS) {
       ESP_LOGD(TAG, "Display queue received data: command: %d", xReceiveStructure.command);
-      // TODO implement
+      switch (xReceiveStructure.command) {
+      case BLINK_CMD:
+        if (state != TIME)
+          break; // No need to blink when time is not displayed
+        constructTimeString(blinkToggle, currentHour, currentMinute, msg, 16);
+        printText(&mx, 0, MAX_DEVICES - 1, msg);
+        blinkToggle = !blinkToggle;
+        break;
+      case UPDATE_TIME_CMD:
+        struct tm_timeinfo* timeinfo;
+        currentHour = xReceiveStructure.intData1;
+        currentMinute = xReceiveStructure.intData2;
+        if (state == TIME) {
+          constructTimeString(blinkToggle, currentHour, currentMinute, msg, 16);
+          printText(&mx, 0, MAX_DEVICES - 1, msg);
+        }
+        break;
+      case BUTTON_PRESS_CMD:
+        if (state == TIME) {
+          state = INSIDE_TEMP;
+          constructTempString(currentInsideTemp, msg, 16);
+          printText(&mx, 0, MAX_DEVICES - 1, msg);
+          // Todo software timer to return to time state
+          break;
+        } else if (state == INSIDE_TEMP) {
+          state = OUTSIDE_TEMP;
+          constructTempString(currentOutsideTemp, msg, 16);
+          printText(&mx, 0, MAX_DEVICES - 1, msg);
+          // Todo software timer to return to time state
+          break;
+        } else if (state == OUTSIDE_TEMP) {
+          state = TIME;
+          constructTimeString(blinkToggle, currentHour, currentMinute, msg, 16);
+          printText(&mx, 0, MAX_DEVICES - 1, msg);
+          // Todo clear any software timer
+          break;
+        }
+        break;
+      case INSIDE_TEMP_CMD:
+        currentInsideTemp = xReceiveStructure.floatData1;
+        if (state == INSIDE_TEMP) {
+          constructTempString(currentInsideTemp, msg, 16);
+          printText(&mx, 0, MAX_DEVICES - 1, msg);
+        }
+        break;
+      case OUTSIDE_TEMP_CMD:
+        currentOutsideTemp = xReceiveStructure.floatData1;
+        if (state == OUTSIDE_TEMP) {
+          constructTempString(currentOutsideTemp, msg, 16);
+          printText(&mx, 0, MAX_DEVICES - 1, msg);
+        }
+        break;
+      }
     }
   }
 }
@@ -287,7 +384,8 @@ void buttonInit() {
   gpio_set_pull_mode((gpio_num_t) CONFIG_BUTTON_PIN, GPIO_PULLUP_ONLY);
 
   // Configure interrupt
-  ESP_ERROR_CHECK(gpio_set_intr_type((gpio_num_t) CONFIG_BUTTON_PIN, (gpio_int_type_t) GPIO_PIN_INTR_NEGEDGE));
+  ESP_ERROR_CHECK(
+      gpio_set_intr_type((gpio_num_t) CONFIG_BUTTON_PIN, (gpio_int_type_t) GPIO_PIN_INTR_NEGEDGE));
   gpio_install_isr_service(0);
   gpio_isr_handler_add((gpio_num_t) CONFIG_BUTTON_PIN, (gpio_isr_t) buttonISRHandler, NULL);
 }
@@ -309,9 +407,11 @@ void buttonTask(void *pvParameters) {
     if (xSemaphoreTake(xSemaphore, portMAX_DELAY) == pdTRUE) {
       currentButtonPressTick = xTaskGetTickCount();
       // Only process once per debounce interval
-      // TODO: optimize debouncing
-      if (currentButtonPressTick - lastButtonPressTick > pdMS_TO_TICKS(CONFIG_BUTTON_DEBOUNCE_INTERVAL)) {
+      if (currentButtonPressTick
+          - lastButtonPressTick> pdMS_TO_TICKS(CONFIG_BUTTON_DEBOUNCE_INTERVAL)) {
         ESP_LOGD(TAG, "Button pressed!");
+        display_data_t data = { BUTTON_PRESS_CMD, NULL, NULL, NULL };
+        xQueueSendToBack(xDisplayQueue, &data, 0); // Send without blocking
       }
       lastButtonPressTick = currentButtonPressTick;
     }
@@ -321,12 +421,11 @@ void buttonTask(void *pvParameters) {
 /**
  * RTOS task to manage SNTP. Will try and fetch current time periodically
  *
- * @param pvParameters  RTOS parameter, not used
+ * @param pvParameters RTOS parameter, not used
  */
 void ntpTask(void *pvParameters) {
   ESP_LOGI(TAG, "SNTP: Waiting for network");
-  xEventGroupWaitBits(wifi_event_group, CONNECTED_BIT,
-  false, true, portMAX_DELAY);
+  xEventGroupWaitBits(wifi_event_group, CONNECTED_BIT, false, true, portMAX_DELAY);
   ESP_LOGI(TAG, "Initializing SNTP");
   sntp_setoperatingmode(SNTP_OPMODE_POLL);
   char servername[] = CONFIG_NTP_SERVER;
@@ -377,7 +476,7 @@ static void wifiInit(void) {
   tcpip_adapter_init();
   wifi_event_group = xEventGroupCreate();
   ESP_ERROR_CHECK(esp_event_loop_init(wifi_event_handler, NULL));
-  wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+  wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT() ;
   ESP_ERROR_CHECK(esp_wifi_init(&cfg));
   ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
   wifi_config_t wifi_config;
@@ -397,30 +496,21 @@ static void wifiInit(void) {
 }
 
 /**
- * Initialize timezone
- */
-static void timeInit(void) {
-  setenv("TZ", CONFIG_TIME_ZONE, 1);
-  tzset();
-}
-
-
-/**
  * Main routine: perform initialization and create RTOS tasks
  */
 extern "C" void app_main() {
   spi_device_handle_t spi;
   ESP_ERROR_CHECK(nvs_flash_init());
-  timeInit();
-  // Prepare RTOS queue
+
+// Prepare RTOS queue
   xDisplayQueue = xQueueCreate(16, sizeof(display_data_t));
 
-  //wifiInit();
   spi = displayInit();
   xTaskCreate(&displayTask, "displayTask", 4096, spi, 5, NULL);
+  xTaskCreate(&timeTask, "timeTask", 2048, NULL, 4, NULL);
+  xTaskCreate(&buttonTask, "buttonTask", 2048, NULL, 4, NULL);
+  xTaskCreate(&insideTemperatureTask, "insideTemperatureTask", 2048, NULL, 2, NULL);
+  wifiInit();
+  xTaskCreate(&ntpTask, "ntpTask", 2048, NULL, 0, NULL);
 
-  //xTaskCreate(&buttonTask, "buttonTask", 2048, NULL, 4, NULL);
-
-  //xTaskCreate(&ntpTask, "ntpTask", 2048, NULL, 0, NULL);
-  //xTaskCreate(&insideTemperatureTask, "insideTemperatureTask", 2048, NULL, 0, NULL);
 }
