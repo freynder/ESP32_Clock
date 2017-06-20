@@ -57,33 +57,31 @@ typedef enum {
   TIME, INSIDE_TEMP, OUTSIDE_TEMP
 } display_state_t;
 
-// Event Group Handles
+typedef enum {
+  UPDATE_COLON, UPDATE_TIME, CHANGE_STATE
+} display_command_t;
+
+typedef struct {
+  display_command_t command;
+  void* data;
+} display_data_t;
+
+// RTOS Event Handles
 static EventGroupHandle_t wifi_event_group;
-static EventGroupHandle_t displayStateEventGroup;
 static SemaphoreHandle_t xSemaphore = NULL;
+QueueHandle_t xDisplayQueue;
+
 
 /* The event group allows multiple bits for each event,
  but we only care about one event - are we connected
  to the AP with an IP? */
 const static int CONNECTED_BIT = BIT0;
 
-void insideTemperatureTask(void *pvParameters) {
-  DS_init(CONFIG_TEMP_SENSOR_PIN);
-
-  while (1) {
-    printf("Temperature: %0.1f\n", DS_get_temp());
-    vTaskDelay(pdMS_TO_TICKS(5000));
-  }
-}
-
-/*
- * Initialization routines for LED display.
- */
-
 
 /**
- * Initialization routines for LED display. Initiallizes the SPI bus and attaches
+ * Initialization routines for LED display. Initializes the SPI bus and attaches
  * a newly created SPI handle to it for the LED display.
+ *
  * @return the SPI device handle
  */
 spi_device_handle_t displayInit() {
@@ -101,10 +99,10 @@ spi_device_handle_t displayInit() {
   buscfg.max_transfer_sz = 0;
 
   spi_device_interface_config_t devcfg;
-  devcfg.clock_speed_hz = 10000000;              //Clock out at 10 MHz
+  devcfg.clock_speed_hz = 8000000;              //Clock out at 8Mhz
   devcfg.mode = 0;                               //SPI mode 0
   devcfg.spics_io_num = CONFIG_PIN_NUM_CS;       //CS pin
-  devcfg.queue_size = 7;  //We want to be able to queue 7 transactions at a time
+  devcfg.queue_size = 1;
   devcfg.command_bits = 0;
   devcfg.address_bits = 0;
   devcfg.dummy_bits = 0;
@@ -112,8 +110,8 @@ spi_device_handle_t displayInit() {
   devcfg.cs_ena_pretrans = 0;
   devcfg.cs_ena_posttrans = 0;
   devcfg.flags = 0;
-  devcfg.pre_cb = 0;
-  devcfg.post_cb = 0;
+  devcfg.pre_cb = NULL;
+  devcfg.post_cb = NULL;
 
   //Initialize the SPI bus
   ret = spi_bus_initialize(HSPI_HOST, &buscfg, 1);
@@ -121,8 +119,6 @@ spi_device_handle_t displayInit() {
   //Attach the LED matrix to the SPI bus
   ret = spi_bus_add_device(HSPI_HOST, &devcfg, &spi);
   assert(ret==ESP_OK);
-
-  displayStateEventGroup = xEventGroupCreate();
 
   return spi;
 }
@@ -133,49 +129,17 @@ spi_device_handle_t displayInit() {
  *
  * @param forceUpdate force the display to update itself.
  */
-void displayTime(bool forceUpdate) {
-  static TickType_t lastColonToggle;
-  static TickType_t currentTicks;
-  static bool displayColonChar = true;
+void constructTimeString(bool displayColonChar, char *target, uint32_t maxLength) {
   static time_t now;
   static struct tm timeinfo;
-  static char timeDisplayBuffer[16];
   static char timeFormatWithoutColon[] = "%02d %02d";
   static char timeFormatWithColon[] = "%02d:%02d";
-  static int previousHour = 0;
-  static int previousMinute = 0;
-
-  // Toggle colon between hours and minutes once every second
-  currentTicks = xTaskGetTickCount();
-  bool colonToggled = false;
-  if (lastColonToggle == 0 || currentTicks - lastColonToggle >= pdMS_TO_TICKS(1000)) {
-    lastColonToggle = currentTicks;
-    displayColonChar = !displayColonChar;
-    colonToggled = true;
-  }
 
   // Construct current time string
   time(&now);
   localtime_r(&now, &timeinfo);
-
-  // Check for no change. If so we do not need to update the time display
-  if (!forceUpdate && !colonToggled && previousHour == timeinfo.tm_hour
-      && previousMinute == timeinfo.tm_min) {
-    return;
-  }
-
-  // Construct time display string
-  snprintf(timeDisplayBuffer, sizeof(timeDisplayBuffer),
-      displayColonChar ? timeFormatWithColon : timeFormatWithoutColon, timeinfo.tm_hour,
-      timeinfo.tm_min);
-
-  previousHour = timeinfo.tm_hour;
-  previousMinute = timeinfo.tm_min;
-  // Display the result
-  // TODO: print to LED display
-  // TODO: assess if display requires update (different from last update?)
-  printf(timeDisplayBuffer);
-  printf("\n");
+  snprintf(target, maxLength, displayColonChar ? timeFormatWithColon : timeFormatWithoutColon,
+      timeinfo.tm_hour, timeinfo.tm_min);
 }
 
 void displayTemp() {
@@ -248,71 +212,57 @@ void printText(MD_MAX72XX *mx, uint8_t modStart, uint8_t modEnd, char *pMsg)
 }
 
 /**
- * RTOS task to manage the LED display
+ * RTOS task to manage inside temperature
  *
  * @param pvParameters RTOS parameter, not used
  */
-void displayTask(void *pvParameters) {
-  display_state_t state = TIME;
-  TickType_t lastStateChange = xTaskGetTickCount();
-  static bool forceUpdate;
-  EventBits_t uxBitsToWaitFor;
-  spi_device_handle_t spi = (spi_device_handle_t) pvParameters;
-
-  ESP_LOGD(TAG, "NOW!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
-  // Initialize led hardware
-  MD_MAX72XX mx = MD_MAX72XX(spi, MAX_DEVICES);
-  ESP_LOGD(TAG, "BEGIN!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
-  mx.begin();
-  ESP_LOGD(TAG, "COMPLETED!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
-  char msg[] = "Hi";
-  ESP_LOGD(TAG, "PRINT BEGIN!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
-  printText(&mx, 0, MAX_DEVICES - 1, msg);
-  ESP_LOGD(TAG, "PRINT COMPLETED!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+void insideTemperatureTask(void *pvParameters) {
+  DS_init(CONFIG_TEMP_SENSOR_PIN);
 
   while (1) {
-    forceUpdate = false;
-    // Switch state to default after timeout
-    TickType_t currentTickTime = xTaskGetTickCount();
-    if (state != TIME
-        && currentTickTime - lastStateChange > (CONFIG_DISPLAY_TIMEOUT / portTICK_PERIOD_MS)) {
-      state = TIME;
-      forceUpdate = true;
-    }
-    // Display appropriate information
-    switch (state) {
-    case TIME:
-      displayTime(forceUpdate);
-      break;
-    case INSIDE_TEMP:
-      displayTemp();
-      break;
-    case OUTSIDE_TEMP:
-      displayOutsideTemp();
-      break;
-    default:
-      break;
-    }
-    // Wait for state switch or timeout
-    uxBitsToWaitFor = (1 << TIME) || (1 << INSIDE_TEMP) || (1 << OUTSIDE_TEMP);
-    EventBits_t waitResult = xEventGroupWaitBits(displayStateEventGroup, uxBitsToWaitFor,
-    pdTRUE, pdFALSE, 100 / portTICK_PERIOD_MS);
-    // Detect event
-    if (waitResult != 0) {
-      forceUpdate = true;
-      switch (waitResult) {
-      case (1 << TIME):
-        state = TIME;
-        break;
-      case (1 << INSIDE_TEMP):
-        state = INSIDE_TEMP;
-        break;
-      case (1 << OUTSIDE_TEMP):
-        state = OUTSIDE_TEMP;
-        break;
-      default:
-        break;
-      }
+    printf("Temperature: %0.1f\n", DS_get_temp());
+    vTaskDelay(pdMS_TO_TICKS(5000));
+  }
+}
+
+/**
+ * RTOS task to manage the LED display
+ *
+ * @param pvParameters RTOS parameter, used to pass spi device handle
+ */
+void displayTask(void *pvParameters) {
+  ESP_LOGD(TAG, "Starting displayTask");
+
+  // Prepare variables
+  BaseType_t xStatus;
+  display_data_t xReceiveStructure;
+  display_state_t state = TIME;
+  TickType_t xTicksToWait = pdMS_TO_TICKS(500); // Wait for max 500ms on each iteration
+  spi_device_handle_t spi = (spi_device_handle_t) pvParameters;
+  char msg[16]; // buffer to hold message to display
+
+  // Initialize led hardware
+  ESP_LOGD(TAG, "Initializing MD_MAX72XX");
+  MD_MAX72XX mx = MD_MAX72XX(spi, MAX_DEVICES);
+  mx.begin();
+  mx.control(MD_MAX72XX::INTENSITY, 0);
+  ESP_LOGD(TAG, "MD_MAX72XX Initialized");
+
+  // Test print
+  char hallo[] = "Elsie";
+  ESP_LOGD(TAG, "TEST print time start");
+  constructTimeString(true, msg, 16);
+  ESP_LOGD(TAG, "Printing %s", msg);
+  printText(&mx, 0, MAX_DEVICES - 1, hallo);
+  ESP_LOGD(TAG, "TEST print time completed");
+
+  // task loop
+  while (1) {
+    // Wait for queue event
+    xStatus = xQueueReceive(xDisplayQueue, &xReceiveStructure, xTicksToWait );
+    if(xStatus == pdPASS) {
+      ESP_LOGD(TAG, "Display queue received data: command: %d", xReceiveStructure.command);
+      // TODO implement
     }
   }
 }
@@ -462,11 +412,15 @@ extern "C" void app_main() {
   spi_device_handle_t spi;
   ESP_ERROR_CHECK(nvs_flash_init());
   timeInit();
+  // Prepare RTOS queue
+  xDisplayQueue = xQueueCreate(16, sizeof(display_data_t));
+
   //wifiInit();
   spi = displayInit();
-  xTaskCreate(&displayTask, "displayTask", 2048, spi, 5, NULL);
+  xTaskCreate(&displayTask, "displayTask", 4096, spi, 5, NULL);
 
-  xTaskCreate(&buttonTask, "buttonTask", 2048, NULL, 4, NULL);
+  //xTaskCreate(&buttonTask, "buttonTask", 2048, NULL, 4, NULL);
+
   //xTaskCreate(&ntpTask, "ntpTask", 2048, NULL, 0, NULL);
-  xTaskCreate(&insideTemperatureTask, "insideTemperatureTask", 2048, NULL, 0, NULL);
+  //xTaskCreate(&insideTemperatureTask, "insideTemperatureTask", 2048, NULL, 0, NULL);
 }

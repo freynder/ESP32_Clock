@@ -64,16 +64,8 @@ _updateEnabled(true)
 #endif
 
 void MD_MAX72XX::begin(void) {
-  PRINTS("BEGIN");
-  PRINT("SPI DATA SIZE: ", SPI_DATA_SIZE);
 #ifdef ARCH_ESP32
   // TODO: check if handle is initialized
-  // Set to shutdown mode
-
-//  for(int i = 0; i < _maxDevices; i++) {
-//    controlHardware(i, SHUTDOWN, 1);
-//    spiSend();
-//  }
 #else
   // initialize the AVR hardware
   if (_hardwareSPI)
@@ -106,6 +98,12 @@ void MD_MAX72XX::begin(void) {
 #ifdef ARCH_ESP32
   // allocate in dma capable memory
   _spiData = (uint8_t*) pvPortMallocCaps((size_t) SPI_DATA_SIZE, (uint32_t) MALLOC_CAP_DMA);
+  //_spiData = (uint8_t *) malloc(SPI_DATA_SIZE);
+  // Set to shutdown mode
+  //for(int i = 0; i < _maxDevices; i++) {
+  //  controlHardware(i, SHUTDOWN, ON);
+  //  spiSend();
+  //}
 #else
   _spiData = (uint8_t *) malloc(SPI_DATA_SIZE);
 #endif
@@ -131,17 +129,11 @@ void MD_MAX72XX::begin(void) {
   // - the MAX7219/MAX7221 is shut down.
   // The devices need to be set to our library defaults prior using the
   // display modules.
-  PRINTS("sending control TEST, OFF");
   control(TEST, OFF);				// no test
-  PRINTS("sending control SCANLIMIT");
   control(SCANLIMIT, ROW_SIZE - 1);	// scan limit is set to max on startup
-  PRINTS("sending control INTENSITY");
   control(INTENSITY, MAX_INTENSITY / 2);	// set intensity to a reasonable value
-  PRINTS("sending control DECODE");
   control(DECODE, OFF);	// make sure that no decoding happens (warm boot potential issue)
-  PRINTS("sending clear");
   clear();
-  PRINTS("sending control SHUTDOWN, OFF");
   control(SHUTDOWN, OFF);			// take the modules out of shutdown mode
 }
 
@@ -228,15 +220,11 @@ bool MD_MAX72XX::control(uint8_t startDev, uint8_t endDev,
 
   if (mode < UPDATE)	// device based control
       {
-    PRINTS("Clearing Buffer");
     spiClearBuffer();
     for (uint8_t i = startDev; i <= endDev; i++) {
-      PRINT("Controlling device: ", i);
       controlHardware(i, mode, value);
     }
-    PRINTS("Sending");
     spiSend();
-    PRINTS("Done sending");
   } else				// internal control function, doesn't relate to specific device
   {
     controlLibrary(mode, value);
@@ -327,18 +315,17 @@ void MD_MAX72XX::spiClearBuffer(void)
 
 void MD_MAX72XX::spiSend() {
 #ifdef ARCH_ESP32
-  PRINTS("Preparing transaction");
   esp_err_t ret;
   spi_transaction_t t;
-  memset(&t, 0, sizeof(t));       //Zero out the transaction
-  PRINT("SPI_DATA_SIZE: ", SPI_DATA_SIZE);
-  t.length = SPI_DATA_SIZE;
+  t.address = 0;
+  t.command = 0;
+  t.flags = 0;
+  t.length = SPI_DATA_SIZE * 8;
+  t.rxlength = 0;
   t.tx_buffer = _spiData;
-  t.user = (void*) 0;                //D/C needs to be set to 0
-  PRINTS("Prepared transaction, transmitting");
+  t.rx_buffer = NULL; // No MISO phase
   ret = spi_device_transmit(_spi, &t);  //Transmit!
   assert(ret==ESP_OK);            //Should have had no issues.
-  PRINTS("Transmission done!");
 #else
       // initialise the SPI transaction
       if (_hardwareSPI)
