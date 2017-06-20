@@ -21,7 +21,7 @@
 int DS_GPIO;
 int init=0;
 /// Sends one bit to bus
-void send(char bit){
+void DS_send(char bit){
   gpio_set_direction(DS_GPIO, GPIO_MODE_OUTPUT);
   gpio_set_level(DS_GPIO,0);
   ets_delay_us(5);
@@ -30,7 +30,7 @@ void send(char bit){
   gpio_set_level(DS_GPIO,1);
 }
 // Reads one bit from bus
-unsigned char read(void){
+unsigned char DS_read(void){
   unsigned char PRESENCE=0;
   gpio_set_direction(DS_GPIO, GPIO_MODE_OUTPUT);
   gpio_set_level(DS_GPIO,0);
@@ -42,29 +42,29 @@ unsigned char read(void){
   return(PRESENCE);
 }
 // Sends one byte to bus
-void send_byte(char data){
+void DS_send_byte(char data){
   unsigned char i;
   unsigned char x;
   for(i=0;i<8;i++){
     x = data>>i;
     x &= 0x01;
-    send(x);
+    DS_send(x);
   }
   ets_delay_us(100);
 }
 // Reads one byte from bus
-unsigned char read_byte(void){
+unsigned char DS_read_byte(void){
   unsigned char i;
   unsigned char data = 0;
   for (i=0;i<8;i++)
   {
-    if(read()) data|=0x01<<i;
+    if(DS_read()) data|=0x01<<i;
     ets_delay_us(15);
   }
   return(data);
 }
 // Sends reset pulse
-unsigned char RST_PULSE(void){
+unsigned char DS_RST_PULSE(void){
   unsigned char PRESENCE;
   gpio_set_direction(DS_GPIO, GPIO_MODE_OUTPUT);
   gpio_set_level(DS_GPIO,0);
@@ -82,18 +82,18 @@ float DS_get_temp(void) {
   if(init==1){
     unsigned char check;
     char temp1=0, temp2=0;
-      check=RST_PULSE();
+      check=DS_RST_PULSE();
       if(check==1)
       {
-        send_byte(0xCC);
-        send_byte(0x44);
+        DS_send_byte(0xCC);
+        DS_send_byte(0x44);
         vTaskDelay(750 / portTICK_RATE_MS);
-        check=RST_PULSE();
-        send_byte(0xCC);
-        send_byte(0xBE);
-        temp1=read_byte();
-        temp2=read_byte();
-        check=RST_PULSE();
+        check=DS_RST_PULSE();
+        DS_send_byte(0xCC);
+        DS_send_byte(0xBE);
+        temp1=DS_read_byte();
+        temp2=DS_read_byte();
+        check=DS_RST_PULSE();
         float temp=0;
         temp=(float)(temp1+(temp2*256))/16;
         return temp;

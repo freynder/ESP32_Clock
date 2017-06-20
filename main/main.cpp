@@ -30,11 +30,19 @@
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
 
+#include "lwip/err.h"
+#include "lwip/sockets.h"
+#include "lwip/sys.h"
+#include "lwip/netdb.h"
+#include "lwip/dns.h"
+
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "tcpip_adapter.h"
 #include "esp_log.h"
 #include "esp_event_loop.h"
+
+#include "cJSON.h"
 
 #include "time.h"
 
@@ -49,29 +57,39 @@
 
 // Number of chained LED matrix panels
 #define MAX_DEVICES 4
+// OpenWeatherMap info
+#define OWM_URL "http://api.openweathermap.org/data/2.5/weather?q=" CONFIG_OWM_LOCATION "&APPID=" CONFIG_OWM_APP_ID "&units=metric"
+#define OWM_WEB_SERVER "api.openweathermap.org"
+#define OWM_PORT 80
 
 // For logging
 static const char *TAG = "clock";
 
-typedef enum display_state_t {
+typedef enum {
   TIME, INSIDE_TEMP, OUTSIDE_TEMP
-};
+} display_state_t;
 
-typedef enum display_command_t {
-  UPDATE_TIME_CMD, BLINK_CMD, BUTTON_PRESS_CMD, INSIDE_TEMP_CMD, OUTSIDE_TEMP_CMD
-};
+typedef enum {
+  UPDATE_TIME_CMD, BLINK_CMD, BUTTON_PRESS_CMD, INSIDE_TEMP_CMD, OUTSIDE_TEMP_CMD, RESET_STATE_CMD
+} display_command_t;
 
-typedef struct display_data_t {
+typedef struct {
   display_command_t command;
   uint32_t intData1;
   uint32_t intData2;
   float floatData1;
-};
+} display_data_t;
+
+typedef struct {
+  const char* queueName;
+  float data;
+} mqtt_data_t;
 
 // RTOS Event Handles
 static EventGroupHandle_t wifi_event_group;
 static SemaphoreHandle_t xSemaphore = NULL;
 QueueHandle_t xDisplayQueue;
+QueueHandle_t xMQTTQueue;
 
 /* The event group allows multiple bits for each event,
  but we only care about one event - are we connected
@@ -213,14 +231,139 @@ void printText(MD_MAX72XX *mx, uint8_t modStart, uint8_t modEnd, char *pMsg)
  * @param pvParameters RTOS parameter, not used
  */
 void insideTemperatureTask(void *pvParameters) {
+  uint32_t counter = 0;
   DS_init(CONFIG_TEMP_SENSOR_PIN);
 
   while (1) {
     float temp = DS_get_temp();
-    printf("Temperature: %0.1f\n", DS_get_temp());
-    display_data_t data = { INSIDE_TEMP_CMD, NULL, NULL, temp };
+    ESP_LOGD(TAG, "Retrieved inside temperature: %0.1f", temp);
+
+    // Every reading to display
+    display_data_t data = { INSIDE_TEMP_CMD, 0, 0, temp };
     xQueueSendToBack(xDisplayQueue, &data, 0); // Send without blocking
+
+    // Once every 15 readings (15 seconds), send to mqtt
+    if (counter == 0) {
+      mqtt_data_t mqttData = { "inside_temp", temp };
+      xQueueSendToBack(xMQTTQueue, &mqttData, 0); // Send without blocking
+    }
+    counter++;
+    counter %= 15;
+
     vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+}
+
+/**
+ * RTOS task to manage inside temperature
+ *
+ * @param pvParameters RTOS parameter, not used
+ */
+void outsideTemperatureTask(void *pvParameters) {
+  // Construct URLs
+  const char *req = "GET " OWM_URL " HTTP/1.0\r\n"
+  "Host: " OWM_WEB_SERVER "\r\n"
+  "User-Agent: esp-idf/1.0 esp32\r\n"
+  "\r\n";
+
+  struct addrinfo hints;
+  hints.ai_flags = 0;
+  hints.ai_protocol = 0;
+  hints.ai_addrlen = 0;
+  hints.ai_addr = NULL;
+  hints.ai_canonname = NULL;
+  hints.ai_next = NULL;
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_STREAM;
+
+  struct addrinfo *res;
+  struct in_addr *addr;
+  int s, r;
+  char recv_buf[1024];
+
+  while (1) {
+    /* Wait for the callback to set the CONNECTED_BIT in the
+     event group.
+     */
+    xEventGroupWaitBits(wifi_event_group, CONNECTED_BIT, false, true, portMAX_DELAY);
+    ESP_LOGD(TAG, "Connected to AP");
+
+    int err = lwip_getaddrinfo(OWM_WEB_SERVER, "80", &hints, &res);
+    //int err = getaddrinfo(OWM_WEB_SERVER, "80", &hints, &res);
+
+    if (err != 0 || res == NULL) {
+      ESP_LOGE(TAG, "DNS lookup failed err=%d res=%p", err, res);
+      vTaskDelay(1000 / portTICK_PERIOD_MS);
+      continue;
+    }
+
+    /* Code to print the resolved IP.
+     Note: inet_ntoa is non-reentrant, look at ipaddr_ntoa_r for "real" code */
+    addr = &((struct sockaddr_in *) res->ai_addr)->sin_addr;
+    ESP_LOGD(TAG, "DNS lookup succeeded. IP=%s", inet_ntoa(*addr));
+
+    s = socket(res->ai_family, res->ai_socktype, 0);
+    if (s < 0) {
+      ESP_LOGE(TAG, "... Failed to allocate socket.");
+      freeaddrinfo(res);
+      vTaskDelay(1000 / portTICK_PERIOD_MS);
+      continue;
+    }
+    ESP_LOGD(TAG, "... allocated socket\r\n");
+
+    if (connect(s, res->ai_addr, res->ai_addrlen) != 0) {
+      ESP_LOGE(TAG, "... socket connect failed errno=%d", errno);
+      close(s);
+      freeaddrinfo(res);
+      vTaskDelay(4000 / portTICK_PERIOD_MS);
+      continue;
+    }
+
+    ESP_LOGD(TAG, "... connected");
+    freeaddrinfo(res);
+
+    if (write(s, req, strlen(req)) < 0) {
+      ESP_LOGE(TAG, "... socket send failed");
+      close(s);
+      vTaskDelay(pdMS_TO_TICKS(5 * 60 * 1000));
+      continue;
+    }
+    ESP_LOGI(TAG, "... socket send success");
+
+    /* Read HTTP response */
+    // TODO: we trust that recv_buf will hold the complete response, but this is not
+    // a general case. Think about dynamically allocating a receive buffer. We can
+    // trust that the OpenWeatherData response will fit though.
+    bzero(recv_buf, sizeof(recv_buf));
+    r = read(s, recv_buf, sizeof(recv_buf) - 1);
+    recv_buf[r] = '\0'; // End of string
+    close(s);
+
+    ESP_LOGD(TAG, "received: %s", recv_buf);
+
+    // Extract body
+    char* body = recv_buf;
+    // Find body, this should start after 2 newlines
+    body = index(body, '{');
+    ESP_LOGD(TAG, "body: %s", body);
+
+    // Parse it
+    cJSON *root = cJSON_Parse(body);
+    if (root == NULL) {
+      ESP_LOGE(TAG, "... socket send failed");
+      vTaskDelay(pdMS_TO_TICKS(5 * 60 * 1000));
+      continue;
+    }
+    cJSON *main = cJSON_GetObjectItem(root, "main");
+    float temp = cJSON_GetObjectItem(main, "temp")->valuedouble;
+
+    ESP_LOGD(TAG, "Extracted temperature: %.1f", temp);
+    // Send data
+    display_data_t data = { OUTSIDE_TEMP_CMD, 0, 0, temp };
+    xQueueSendToBack(xDisplayQueue, &data, 0); // Send without blocking
+    mqtt_data_t mqttData = { "outside_temp", temp };
+    xQueueSendToBack(xMQTTQueue, &mqttData, 0); // Send without blocking
+    vTaskDelay(pdMS_TO_TICKS(5 * 60 * 1000)); // Every 5 minutes
   }
 }
 
@@ -250,7 +393,7 @@ void timeTask(void *pvParameters) {
       previousHour = timeinfo.tm_hour;
       previousMinute = timeinfo.tm_min;
       // Notify display
-      display_data_t data = { UPDATE_TIME_CMD, previousHour, previousMinute, NULL };
+      display_data_t data = { UPDATE_TIME_CMD, previousHour, previousMinute, 0. };
       xQueueSendToBack(xDisplayQueue, &data, 0); // Send without blocking
     }
     vTaskDelay(pdMS_TO_TICKS(500)); // Wait 500ms
@@ -263,7 +406,12 @@ void timeTask(void *pvParameters) {
  * @param xTimer
  */
 void blinkTimerCallback(TimerHandle_t xTimer) {
-  display_data_t data = { BLINK_CMD, NULL, NULL, NULL };
+  display_data_t data = { BLINK_CMD, 0, 0, 0. };
+  xQueueSendToBack(xDisplayQueue, &data, 0); // Send without blocking
+}
+
+void displayTimeoutTimerCallback(TimerHandle_t xTimer) {
+  display_data_t data = { RESET_STATE_CMD, 0, 0, 0. };
   xQueueSendToBack(xDisplayQueue, &data, 0); // Send without blocking
 }
 
@@ -275,7 +423,7 @@ void blinkTimerCallback(TimerHandle_t xTimer) {
 void displayTask(void *pvParameters) {
   ESP_LOGD(TAG, "Starting displayTask");
   TimerHandle_t blinkTimer;
-  TimerHandle_t displayTimoutTimer;
+  TimerHandle_t displayTimoutTimer = NULL;
 
   // Prepare variables
   BaseType_t xStatus;
@@ -293,6 +441,10 @@ void displayTask(void *pvParameters) {
   // Init blink timer
   blinkTimer = xTimerCreate("blinkTimer", pdMS_TO_TICKS(1000), pdTRUE, 0, blinkTimerCallback);
   xTimerStart(blinkTimer, 0);
+
+  // Init display timeout timer
+  displayTimoutTimer = xTimerCreate("displayTimoutTimer", pdMS_TO_TICKS(10000), pdFALSE, 0,
+      displayTimeoutTimerCallback);
 
   // Initialize led hardware
   ESP_LOGD(TAG, "Initializing MD_MAX72XX");
@@ -316,7 +468,6 @@ void displayTask(void *pvParameters) {
         blinkToggle = !blinkToggle;
         break;
       case UPDATE_TIME_CMD:
-        struct tm_timeinfo* timeinfo;
         currentHour = xReceiveStructure.intData1;
         currentMinute = xReceiveStructure.intData2;
         if (state == TIME) {
@@ -329,19 +480,19 @@ void displayTask(void *pvParameters) {
           state = INSIDE_TEMP;
           constructTempString(currentInsideTemp, msg, 16);
           printText(&mx, 0, MAX_DEVICES - 1, msg);
-          // Todo software timer to return to time state
+          xTimerStart(displayTimoutTimer, 0);
           break;
         } else if (state == INSIDE_TEMP) {
           state = OUTSIDE_TEMP;
           constructTempString(currentOutsideTemp, msg, 16);
           printText(&mx, 0, MAX_DEVICES - 1, msg);
-          // Todo software timer to return to time state
+          xTimerReset(displayTimoutTimer, 0);
           break;
         } else if (state == OUTSIDE_TEMP) {
           state = TIME;
           constructTimeString(blinkToggle, currentHour, currentMinute, msg, 16);
           printText(&mx, 0, MAX_DEVICES - 1, msg);
-          // Todo clear any software timer
+          xTimerStop(displayTimoutTimer, 0);
           break;
         }
         break;
@@ -359,7 +510,28 @@ void displayTask(void *pvParameters) {
           printText(&mx, 0, MAX_DEVICES - 1, msg);
         }
         break;
+      case RESET_STATE_CMD:
+        state = TIME;
+        constructTimeString(blinkToggle, currentHour, currentMinute, msg, 16);
+        printText(&mx, 0, MAX_DEVICES - 1, msg);
+        break;
       }
+    }
+  }
+}
+
+void mqttTask(void *pvParameters) {
+  // Prepare vars
+  mqtt_data_t xReceiveStructure;
+  BaseType_t xStatus;
+  TickType_t xTicksToWait = pdMS_TO_TICKS(500); // Wait for max 500ms on each iteration
+
+  // task loop
+  while (1) {
+    // Wait for queue event
+    xStatus = xQueueReceive(xMQTTQueue, &xReceiveStructure, xTicksToWait);
+    if (xStatus == pdPASS) {
+      ESP_LOGD(TAG, "MQTT queue received data: queue: %s", xReceiveStructure.queueName);
     }
   }
 }
@@ -410,7 +582,7 @@ void buttonTask(void *pvParameters) {
       if (currentButtonPressTick
           - lastButtonPressTick> pdMS_TO_TICKS(CONFIG_BUTTON_DEBOUNCE_INTERVAL)) {
         ESP_LOGD(TAG, "Button pressed!");
-        display_data_t data = { BUTTON_PRESS_CMD, NULL, NULL, NULL };
+        display_data_t data = { BUTTON_PRESS_CMD, 0, 0, 0. };
         xQueueSendToBack(xDisplayQueue, &data, 0); // Send without blocking
       }
       lastButtonPressTick = currentButtonPressTick;
@@ -476,7 +648,8 @@ static void wifiInit(void) {
   tcpip_adapter_init();
   wifi_event_group = xEventGroupCreate();
   ESP_ERROR_CHECK(esp_event_loop_init(wifi_event_handler, NULL));
-  wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT() ;
+  wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT()
+  ;
   ESP_ERROR_CHECK(esp_wifi_init(&cfg));
   ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
   wifi_config_t wifi_config;
@@ -504,13 +677,15 @@ extern "C" void app_main() {
 
 // Prepare RTOS queue
   xDisplayQueue = xQueueCreate(16, sizeof(display_data_t));
+  xMQTTQueue = xQueueCreate(16, sizeof(mqtt_data_t));
 
   spi = displayInit();
   xTaskCreate(&displayTask, "displayTask", 4096, spi, 5, NULL);
-  xTaskCreate(&timeTask, "timeTask", 2048, NULL, 4, NULL);
-  xTaskCreate(&buttonTask, "buttonTask", 2048, NULL, 4, NULL);
-  xTaskCreate(&insideTemperatureTask, "insideTemperatureTask", 2048, NULL, 2, NULL);
+  xTaskCreate(&timeTask, "timeTask", 2048, NULL, 5, NULL);
+  xTaskCreate(&buttonTask, "buttonTask", 2048, NULL, 5, NULL);
+  xTaskCreate(&insideTemperatureTask, "insideTemperatureTask", 2048, NULL, 4, NULL);
   wifiInit();
-  xTaskCreate(&ntpTask, "ntpTask", 2048, NULL, 0, NULL);
-
+  xTaskCreate(&ntpTask, "ntpTask", 2048, NULL, 3, NULL);
+  xTaskCreate(&outsideTemperatureTask, "outsideTemperatureTask", 4096, NULL, 4, NULL);
+  xTaskCreate(&mqttTask, "mqttTask", 2048, NULL, 2, NULL);
 }

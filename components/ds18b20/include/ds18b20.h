@@ -15,11 +15,11 @@
 #ifndef DS18B20_H_  
 #define DS18B20_H_
 
-void send(char bit);
-unsigned char read(void);
-void send_byte(char data);
-unsigned char read_byte(void);
-unsigned char RST_PULSE(void);
+void DS_send(char bit);
+unsigned char rDS_ead(void);
+void DS_send_byte(char data);
+unsigned char DS_read_byte(void);
+unsigned char DS_RST_PULSE(void);
 extern "C" float DS_get_temp(void);
 extern "C" void DS_init(int GPIO);
 
